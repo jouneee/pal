@@ -9,8 +9,14 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
-#define SAMPLE_COUNT 1024
+#define MAX_PROVIDED_IMAGES 128
 #define MAX_PLACEHOLDER_LEN 32
+#define SAMPLE_COUNT 1024
+#define PALETTE_COUNT 16
+
+#define MAX(a, b) ((a > b) ? a : b)
+#define MIN(a, b) ((a < b) ? a : b)
+#define CLAMP(a, b, c) (a < b) ? b : (a > c) ? c : a
 
 typedef struct {
     uint8_t r, g, b;
@@ -30,11 +36,10 @@ typedef enum {
 
 typedef struct {
     int bgfg;
-    int num_accents;
+    int using_template;
     float saturation;
     Method method;
     Format format;
-    int using_template;
 } Config;
 
 float get_luminance(Color c) {
@@ -46,8 +51,8 @@ float color_dist(Color a, Color b) {
 }
 
 int calculate_vibrancy(Color c) {
-    int max = c.r > c.g ? (c.r > c.b ? c.r : c.b) : (c.g > c.b ? c.g : c.b);
-    int min = c.r < c.g ? (c.r < c.b ? c.r : c.b) : (c.g < c.b ? c.g : c.b);
+    int max = MAX(c.r, MAX(c.g, c.b));
+    int min = MIN(c.r, MIN(c.g, c.b));
     return max - min;
 }
 
@@ -55,17 +60,13 @@ int compare_vibrancy(const void *a, const void *b) {
     return ((Color*)b)->vibrancy - ((Color*)a)->vibrancy;
 }
 
-uint8_t clamp_u8(float v) {
-    return (v < 0) ? 0 : (v > 255) ? 255 : (uint8_t)v;
-}
-
 void apply_saturation(Color *c, float saturation) {
     if (saturation == 1.0) return;
     float gray = c->luminance * 255.0f;
 
-    c->r = clamp_u8(gray + saturation * (c->r - gray));
-    c->g = clamp_u8(gray + saturation * (c->g - gray));
-    c->b = clamp_u8(gray + saturation * (c->b - gray));
+    c->r = (uint8_t)(CLAMP((gray + saturation * (c->r - gray)), 0, 255));
+    c->g = (uint8_t)(CLAMP((gray + saturation * (c->g - gray)), 0, 255));
+    c->b = (uint8_t)(CLAMP((gray + saturation * (c->b - gray)), 0, 255));
 }
 
 void generate_scheme(uint8_t *pixels, int w, int h, Config config, Color *out_palette, Color *out_bg, Color *out_fg) {
@@ -107,14 +108,14 @@ void generate_scheme(uint8_t *pixels, int w, int h, Config config, Color *out_pa
     qsort(samples, count, sizeof(Color), compare_vibrancy);
 
     int picked = 0;
-    Color selected[16];
-    for (int i = 0; i < count && picked < config.num_accents; i++) {
+    Color selected[PALETTE_COUNT];
+    for (int i = 0; i < count && picked < PALETTE_COUNT; i++) {
         int distinct = 1;
         
         // dont pick colors too close to bg or fg
         float diff_bg = fabsf(samples[i].luminance - darkest.luminance);
         float diff_fg = fabsf(samples[i].luminance - lightest.luminance);
-        if (diff_bg < 0.15f || diff_fg < 0.15f) distinct = 0;
+        if (diff_bg < 0.08f || diff_fg < 0.08f) distinct = 0;
 
         for (int j = 0; j < picked; j++) {
             int d = abs(samples[i].r - selected[j].r) + 
@@ -168,8 +169,6 @@ void generate_scheme_kmeans(uint8_t *pixels, int w, int h, Config config, Color 
             samples[count++] = c;
         }
     } 
-
-    
     qsort(samples, count, sizeof(Color), compare_vibrancy);
 
     Color centers[16];
@@ -196,7 +195,7 @@ void generate_scheme_kmeans(uint8_t *pixels, int w, int h, Config config, Color 
             b_sum[best_idx] += samples[idx].b;
             counts[best_idx]++;
         }
-        for (int k = 0; k < config.num_accents; k++) {    
+        for (int k = 0; k < PALETTE_COUNT; k++) {    
             if (counts[k] > 0) {
                 centers[k].r = (uint8_t)(r_sum[k] / counts[k]);
                 centers[k].g = (uint8_t)(g_sum[k] / counts[k]);
@@ -206,7 +205,7 @@ void generate_scheme_kmeans(uint8_t *pixels, int w, int h, Config config, Color 
             }
         }
     }
-    for (int k = 0; k < config.num_accents; k++) {
+    for (int k = 0; k < PALETTE_COUNT; k++) {
         apply_saturation(&centers[k], config.saturation);
         out_palette[k] = centers[k];
     }
@@ -225,75 +224,78 @@ static void color_to_string(Color c, Format format, char *buf, size_t buflen) {
 }
 
 char *template_processor(FILE *template_file, Color bg, Color fg, Color *palette, Config config) {
-    struct stat st;
-    if (fstat(fileno(template_file), &st) != 0) {
-        return 0;
-    }
-    long filesize = st.st_size;
-    size_t capacity = filesize + 1024;
-    char *result = malloc(capacity);
-    if (!result) return NULL;
-
-    size_t len = 0;
-
-    char bg_str[20], fg_str[20];
-    color_to_string(bg, config.format, bg_str, sizeof(bg_str));
-    color_to_string(fg, config.format, fg_str, sizeof(fg_str));
-
-    char **accent_strings = malloc(config.num_accents * sizeof(char*));
-    for (int i = 0; i < config.num_accents; i++) {
-        accent_strings[i] = malloc(20);
-        color_to_string(palette[i], config.format, accent_strings[i], 20);
-    }
-    
-    enum { OUTSIDE, INSIDE } state = OUTSIDE;
-    char placeholder[MAX_PLACEHOLDER_LEN];
-    int p_pos = 0;
-    int c;
-
-    rewind(template_file);
-    while ((c = fgetc(template_file)) != EOF) {
-        switch (state) {
-            case OUTSIDE:
-                if (c == '`') {
-                    state = INSIDE;
-                    p_pos = 0;
-                } else {
-                    result[len++] = (char)c;
-                }
-                break;
-            case INSIDE:
-                if (c == '`') {
-                    placeholder[p_pos] = '\0';
-                    char *target = NULL;
-
-                    if (strcmp(placeholder, "@background") == 0) target = bg_str;
-                    else if (strcmp(placeholder, "@foreground") == 0) target = fg_str;
-                    else if (strncmp(placeholder, "@color", 6) == 0) {
-                        int i = atoi(placeholder + 6);
-                        if (i >= 0 && i < config.num_accents) target = accent_strings[i];
-                    }
-                    if (target) {
-                        size_t t_len = strlen(target);
-                        memcpy(result + len, target, t_len);
-                        len += t_len;
-                    } else {
-                        result[len++] = '`';
-                        size_t p_len = strlen(placeholder);
-                        memcpy(result + len, placeholder, p_len);
-                        len += p_len;
-                        result[len++] = '`';
-                    }
-                    state = OUTSIDE;
-                } else if (p_pos < MAX_PLACEHOLDER_LEN - 1) {
-                    placeholder[p_pos++] = (char)c;
-                }
-            break;
+    char *result = NULL;
+    if (fseek(template_file, 0L, SEEK_END) == 0) {
+        long bufsize = ftell(template_file);
+        if(bufsize == -1) {
+            fprintf(stderr, "Error: template file is corrupted\n");
+            return NULL;
         }
+        
+        result = malloc(sizeof(char) * (bufsize + 1));
+        if (fseek(template_file, 0L, SEEK_SET) != 0) {
+            free(result);
+            return NULL;
+        }
+        char bg_str[20], fg_str[20];
+        color_to_string(bg, config.format, bg_str, sizeof(bg_str));
+        color_to_string(fg, config.format, fg_str, sizeof(fg_str));
+        
+        char **accent_strings = malloc(PALETTE_COUNT * sizeof(char*));
+        for (int i = 0; i < PALETTE_COUNT; i++) {
+            accent_strings[i] = malloc(20);
+            color_to_string(palette[i], config.format, accent_strings[i], 20);
+        }
+        
+        enum { OUTSIDE, INSIDE } state = OUTSIDE;
+        char placeholder[MAX_PLACEHOLDER_LEN];
+        int len = 0;
+        int p_pos = 0;
+        int c;
+        while ((c = fgetc(template_file)) != EOF) {
+            switch (state) {
+                case OUTSIDE:
+                    if (c == '`') {
+                        state = INSIDE;
+                        p_pos = 0;
+                    } else {
+                        result[len++] = (char)c;
+                    }
+                    break;
+                case INSIDE:
+                    if (c == '`') {
+                        placeholder[p_pos] = '\0';
+                        char *target = NULL;
+    
+                        if (strcmp(placeholder, "@background") == 0) target = bg_str;
+                        else if (strcmp(placeholder, "@foreground") == 0) target = fg_str;
+                        else if (strncmp(placeholder, "@color", 6) == 0) {
+                            int i = atoi(placeholder + 6);
+                            if (i >= 0 && i < PALETTE_COUNT) target = accent_strings[i];
+                        }
+                        if (target) {
+                            size_t t_len = strlen(target);
+                            memcpy(result + len, target, t_len);
+                            len += t_len;
+                        } else {
+                            result[len++] = '`';
+                            size_t p_len = strlen(placeholder);
+                            memcpy(result + len, placeholder, p_len);
+                            len += p_len;
+                            result[len++] = '`';
+                        }
+                        state = OUTSIDE;
+                    } else if (p_pos < MAX_PLACEHOLDER_LEN - 1) {
+                        placeholder[p_pos++] = (char)c;
+                    }
+                break;
+            }
+        }
+        result[len] = '\0';
+        free(accent_strings);
+        return result;
     }
-    result[len] = '\0';
-    free(accent_strings);
-    return result;
+    return NULL;
 }
 
 uint32_t fnv32_hash(unsigned char *s, size_t len)
@@ -316,7 +318,6 @@ uint32_t hash_metadata(const char *filename, Config config)
     
     uint32_t h = fnv32_hash((unsigned char *)filename,          strlen(filename));
     h ^= fnv32_hash((unsigned char *)&config.saturation,        sizeof(config.saturation) );
-    h ^= fnv32_hash((unsigned char *)&config.num_accents,       sizeof(config.num_accents));
     h ^= fnv32_hash((unsigned char *)&config.method,            sizeof(config.method));
     h ^= fnv32_hash((unsigned char *)&config.format,            sizeof(config.format));
     h ^= fnv32_hash((unsigned char *)&config.using_template,    sizeof(config.using_template));
@@ -340,7 +341,7 @@ void get_cache_path(uint32_t hash, char *output, size_t size)
         snprintf(dir_path, sizeof(dir_path), "%s/.cache/pal", home_path);
     }
     mkdir(dir_path, 0755);
-    snprintf(output, size, "%s/%08X.bin", dir_path, hash);
+    snprintf(output, size, "%s/%08X", dir_path, hash);
 }
 
 char *args_shift(int *argc, char ***argv) {
@@ -354,21 +355,19 @@ char *args_shift(int *argc, char ***argv) {
 int main(int argc, char **argv) {
     const char *program = args_shift(&argc, &argv);
     const char *template_file = NULL;
-    Config config = {   .bgfg = 1, 
-                        .num_accents = 16, 
+    Config config = {   .bgfg = 1,
+                        .using_template = 0,
                         .saturation = 1.0, 
                         .method = KMEANS, 
-                        .format = HEX, 
-                        .using_template = 1 };
+                        .format = HEX };
 
-    const char *input_files[128];
+    const char *input_files[MAX_PROVIDED_IMAGES];
     int input_count = 0;
 
     if (argc <= 0) {
         printf("Usage: %s [arg1] [arg2] <image1> <image2> ...\n", program);
         printf("\n");
         printf("\t-n \tDont print background and foreground\n");
-        printf("\t-c \tAmount of accent colors\n");
         printf("\t-s \tSaturation (float)\n");
         printf("\t-m \tColor picking method (0 - Area Average, 1 - K-Means)\n");
         printf("\t-f \tOutput format (0 - rgb, 1 - hex)\n");
@@ -381,36 +380,23 @@ int main(int argc, char **argv) {
         if (strcmp(arg,"-n") == 0) {
             config.bgfg = 0;
         }
-        else if (strcmp(arg,"-c") == 0) {
-            if (argc <= 0) {
-                return fprintf(stderr, "Error: %s requires a number\n", arg), 1;
-            }
-            config.num_accents = atoi(args_shift(&argc, &argv));
-        }
         else if (strcmp(arg,"-s") == 0) {
-            if (argc <= 0) {
-                return fprintf(stderr, "Error: %s requires a float percentage\n", arg), 1;
-            }
+            if (argc <= 0) return fprintf(stderr, "Error: %s requires a float percentage\n", arg), 1;
+
             config.saturation = atof(args_shift(&argc, &argv));
+            if (config.method > 1 || config.method < 0) return 1;
         }
         else if (strcmp(arg,"-m") == 0) {
-            if (argc <= 0) {
-                return fprintf(stderr, "Error: %s requires either 0 or 1\n", arg), 1;
-            }
+            if (argc <= 0) return fprintf(stderr, "Error: %s requires either 0 or 1\n", arg), 1;
+            
             config.method = atoi(args_shift(&argc, &argv));
-            if (config.method > 1 || config.method < 0) {
-                return 1;
-            }
+            if (config.method > 1 || config.method < 0) return 1;
         }
         else if (strcmp(arg,"-f") == 0) {
-            if (argc <= 0) {
-                fprintf(stderr, "Error: %s requires either 0 or 1\n", arg);
-                return 1;
-            }
+            if (argc <= 0) fprintf(stderr, "Error: %s requires either 0 or 1\n", arg), 1;
+
             config.format = atoi(args_shift(&argc, &argv));
-            if (config.format > 1 || config.format < 0) {
-                return 1;
-            }
+            if (config.format > 1 || config.format < 0) return 1;
         }
         else if (strcmp(arg,"-t") == 0) {
             if (argc <= 0) {
@@ -418,10 +404,10 @@ int main(int argc, char **argv) {
                 return 1;
             }
             template_file = args_shift(&argc, &argv);
-            config.using_template = strlen(template_file);
+            config.using_template = strlen(template_file) + fnv32_hash((unsigned char *)template_file, strlen(template_file));
         }
         else {
-            if (input_count < 128) {
+            if (input_count < MAX_PROVIDED_IMAGES) {
                 input_files[input_count++] = arg;
             } else {
                 fprintf(stderr, "Error: too many inputs, skipping ...");
@@ -449,11 +435,11 @@ int main(int argc, char **argv) {
         Color palette[16];
         Color bg, fg;
         int cached_palette = 0;
-        FILE *f = fopen(cache_path, "rb");
+        FILE *f = fopen(cache_path, "r");
         if (f) {
-            fread(&bg, sizeof(Color), 1, f); 
-            fread(&fg, sizeof(Color), 1, f);
-            fread(palette, sizeof(Color), config.num_accents, f);
+            fread(&bg,     sizeof(Color), 1, f); 
+            fread(&fg,     sizeof(Color), 1, f);
+            fread(palette, sizeof(Color), PALETTE_COUNT, f);
             cached_palette = 1;
         }
         if (!cached_palette) {
@@ -469,11 +455,11 @@ int main(int argc, char **argv) {
             } else {
                 generate_scheme_kmeans(pixels, w, h, config, palette, &bg, &fg);
             }
-            FILE *fw = fopen(cache_path, "wb");
+            FILE *fw = fopen(cache_path, "w");
             if (fw) {
                 fwrite(&bg, sizeof(Color), 1, fw);
                 fwrite(&fg, sizeof(Color), 1, fw);
-                fwrite(palette, sizeof(Color), config.num_accents, fw);
+                fwrite(palette, sizeof(Color), PALETTE_COUNT, fw);
                 fclose(fw);
             }
             stbi_image_free(pixels);
@@ -503,7 +489,7 @@ int main(int argc, char **argv) {
                 printf(pstring, bg.r, bg.g, bg.b);
                 printf(pstring, fg.r, fg.g, fg.b);
             }
-            for (int i = 0; i < config.num_accents; i++) {
+            for (int i = 0; i < PALETTE_COUNT; i++) {
                 printf(pstring, palette[i].r, palette[i].g, palette[i].b);
             }
         }
