@@ -34,6 +34,7 @@ typedef struct {
     float saturation;
     Method method;
     Format format;
+    int using_template;
 } Config;
 
 float get_luminance(Color c) {
@@ -56,6 +57,15 @@ int compare_vibrancy(const void *a, const void *b) {
 
 uint8_t clamp_u8(float v) {
     return (v < 0) ? 0 : (v > 255) ? 255 : (uint8_t)v;
+}
+
+void apply_saturation(Color *c, float saturation) {
+    if (saturation == 1.0) return;
+    float gray = c->luminance * 255.0f;
+
+    c->r = clamp_u8(gray + saturation * (c->r - gray));
+    c->g = clamp_u8(gray + saturation * (c->g - gray));
+    c->b = clamp_u8(gray + saturation * (c->b - gray));
 }
 
 void generate_scheme(uint8_t *pixels, int w, int h, Config config, Color *out_palette, Color *out_bg, Color *out_fg) {
@@ -94,8 +104,6 @@ void generate_scheme(uint8_t *pixels, int w, int h, Config config, Color *out_pa
         }
     }
 
-    *out_bg = darkest;
-    *out_fg = lightest;
     qsort(samples, count, sizeof(Color), compare_vibrancy);
 
     int picked = 0;
@@ -121,15 +129,13 @@ void generate_scheme(uint8_t *pixels, int w, int h, Config config, Color *out_pa
     }
 
     for (int k = 0; k < picked; k++) {
-        Color adjusted = selected[k];
-        if (config.saturation != 1.0f) {
-            float gray = adjusted.luminance * 255.0f;
-            adjusted.r = clamp_u8(gray + config.saturation * (adjusted.r - gray));
-            adjusted.g = clamp_u8(gray + config.saturation * (adjusted.g - gray));
-            adjusted.b = clamp_u8(gray + config.saturation * (adjusted.b - gray));
-        }
-        out_palette[k] = adjusted;
+        apply_saturation(&selected[k], config.saturation);
+        out_palette[k] = selected[k];
     }
+    apply_saturation(&darkest, config.saturation);
+    apply_saturation(&lightest, config.saturation);
+    *out_bg = darkest;
+    *out_fg = lightest;
 }
 
 void generate_scheme_kmeans(uint8_t *pixels, int w, int h, Config config, Color *out_palette, Color *out_bg, Color *out_fg) {
@@ -163,8 +169,7 @@ void generate_scheme_kmeans(uint8_t *pixels, int w, int h, Config config, Color 
         }
     } 
 
-    *out_bg = darkest;
-    *out_fg = lightest;
+    
     qsort(samples, count, sizeof(Color), compare_vibrancy);
 
     Color centers[16];
@@ -202,17 +207,13 @@ void generate_scheme_kmeans(uint8_t *pixels, int w, int h, Config config, Color 
         }
     }
     for (int k = 0; k < config.num_accents; k++) {
-        Color adjusted = centers[k];
-
-        if (config.saturation != 1.0f) {
-            float gray = adjusted.luminance * 255.0f;
-            adjusted.r = clamp_u8(gray + config.saturation * (adjusted.r - gray));
-            adjusted.g = clamp_u8(gray + config.saturation * (adjusted.g - gray));
-            adjusted.b = clamp_u8(gray + config.saturation * (adjusted.b - gray));
-        }
-
-        out_palette[k] = adjusted;
+        apply_saturation(&centers[k], config.saturation);
+        out_palette[k] = centers[k];
     }
+    apply_saturation(&darkest, config.saturation);
+    apply_saturation(&lightest, config.saturation);
+    *out_bg = darkest;
+    *out_fg = lightest;
 }
 
 static void color_to_string(Color c, Format format, char *buf, size_t buflen) {
@@ -223,8 +224,18 @@ static void color_to_string(Color c, Format format, char *buf, size_t buflen) {
     }
 }
 
-void template_processor(FILE *template_file, Color bg, Color fg, Color *palette, Config config) {
-    
+char *template_processor(FILE *template_file, Color bg, Color fg, Color *palette, Config config) {
+    struct stat st;
+    if (fstat(fileno(template_file), &st) != 0) {
+        return 0;
+    }
+    long filesize = st.st_size;
+    size_t capacity = filesize + 1024;
+    char *result = malloc(capacity);
+    if (!result) return NULL;
+
+    size_t len = 0;
+
     char bg_str[20], fg_str[20];
     color_to_string(bg, config.format, bg_str, sizeof(bg_str));
     color_to_string(fg, config.format, fg_str, sizeof(fg_str));
@@ -236,59 +247,54 @@ void template_processor(FILE *template_file, Color bg, Color fg, Color *palette,
     }
     
     enum { OUTSIDE, INSIDE } state = OUTSIDE;
-    char buffer[MAX_PLACEHOLDER_LEN];
-    int buf_pos = 0;
-
+    char placeholder[MAX_PLACEHOLDER_LEN];
+    int p_pos = 0;
     int c;
+
+    rewind(template_file);
     while ((c = fgetc(template_file)) != EOF) {
         switch (state) {
             case OUTSIDE:
                 if (c == '`') {
                     state = INSIDE;
-                    buf_pos = 0;
+                    p_pos = 0;
                 } else {
-                    putchar(c);
+                    result[len++] = (char)c;
                 }
                 break;
             case INSIDE:
                 if (c == '`') {
-                    buffer[buf_pos] = '\0';
+                    placeholder[p_pos] = '\0';
+                    char *target = NULL;
 
-                    if (buffer[0] == '@') {
-                        if (strcmp(buffer, "@background") == 0) {
-                            fputs(bg_str, stdout);
-                        } else if (strcmp(buffer, "@foreground") == 0) {
-                            fputs(fg_str, stdout);
-                        } else if (strncmp(buffer, "@color", 6) == 0) {
-                            int i = atoi(buffer + 6);
-                            if (i >= 0 && i < config.num_accents) {
-                                fputs(accent_strings[i], stdout);
-                            } else {
-                                printf("`%s`", buffer); // invalid string will be spat back out
-                            }
-                        } else {
-                            printf("`%s`", buffer);
-                        }
+                    if (strcmp(placeholder, "@background") == 0) target = bg_str;
+                    else if (strcmp(placeholder, "@foreground") == 0) target = fg_str;
+                    else if (strncmp(placeholder, "@color", 6) == 0) {
+                        int i = atoi(placeholder + 6);
+                        if (i >= 0 && i < config.num_accents) target = accent_strings[i];
+                    }
+                    if (target) {
+                        size_t t_len = strlen(target);
+                        memcpy(result + len, target, t_len);
+                        len += t_len;
+                    } else {
+                        result[len++] = '`';
+                        size_t p_len = strlen(placeholder);
+                        memcpy(result + len, placeholder, p_len);
+                        len += p_len;
+                        result[len++] = '`';
                     }
                     state = OUTSIDE;
+                } else if (p_pos < MAX_PLACEHOLDER_LEN - 1) {
+                    placeholder[p_pos++] = (char)c;
                 }
-                else if (buf_pos < MAX_PLACEHOLDER_LEN - 1) {
-                    buffer[buf_pos++] = c;              // silently drop placeholders too long
-                }
-                break;
+            break;
         }
     }
-    if (state == INSIDE) {
-        fprintf(stderr, "Warning: unterminated placeholder at EOF\n");
-        printf("`%.*s", MAX_PLACEHOLDER_LEN - 1, buffer);
-    }
-
-    for (int i = 0; i < config.num_accents; i++) {
-        free(accent_strings[i]);
-    }
+    result[len] = '\0';
     free(accent_strings);
+    return result;
 }
-
 
 uint32_t fnv32_hash(unsigned char *s, size_t len)
 {
@@ -301,13 +307,21 @@ uint32_t fnv32_hash(unsigned char *s, size_t len)
     return h;
 }
 
-uint32_t final_hash(uint8_t *pixels, size_t len, Config config) 
+uint32_t hash_metadata(const char *filename, Config config) 
 {
-    uint32_t h = fnv32_hash(pixels, len);
-    h ^= fnv32_hash((unsigned char *)&config.saturation,    sizeof(config.saturation) );
-    h ^= fnv32_hash((unsigned char *)&config.num_accents,   sizeof(config.num_accents));
-    h ^= fnv32_hash((unsigned char *)&config.method,        sizeof(config.method));
-    h ^= fnv32_hash((unsigned char *)&config.format,        sizeof(config.format));
+    struct stat st;
+    if (stat(filename, &st) != 0) {
+        return 0;
+    }
+    
+    uint32_t h = fnv32_hash((unsigned char *)filename,          strlen(filename));
+    h ^= fnv32_hash((unsigned char *)&config.saturation,        sizeof(config.saturation) );
+    h ^= fnv32_hash((unsigned char *)&config.num_accents,       sizeof(config.num_accents));
+    h ^= fnv32_hash((unsigned char *)&config.method,            sizeof(config.method));
+    h ^= fnv32_hash((unsigned char *)&config.format,            sizeof(config.format));
+    h ^= fnv32_hash((unsigned char *)&config.using_template,    sizeof(config.using_template));
+    h ^= fnv32_hash((unsigned char *)&st.st_mtim,               sizeof(st.st_mtim));
+    h ^= fnv32_hash((unsigned char *)&st.st_size,               sizeof(st.st_size));
     return h;
 }
 
@@ -340,7 +354,15 @@ char *args_shift(int *argc, char ***argv) {
 int main(int argc, char **argv) {
     const char *program = args_shift(&argc, &argv);
     const char *template_file = NULL;
-    Config config = { .bgfg = 1, .num_accents = 16, .saturation = 1.0, .method = 1, .format = HEX };
+    Config config = {   .bgfg = 1, 
+                        .num_accents = 16, 
+                        .saturation = 1.0, 
+                        .method = KMEANS, 
+                        .format = HEX, 
+                        .using_template = 1 };
+
+    const char *input_files[128];
+    int input_count = 0;
 
     if (argc <= 0) {
         printf("Usage: %s [arg1] [arg2] <image1> <image2> ...\n", program);
@@ -355,38 +377,34 @@ int main(int argc, char **argv) {
     }
 
     while (argc > 0) {
-        char *flag = args_shift(&argc, &argv);
-
-        if (strcmp(flag,"-n") == 0) {
+        char *arg = args_shift(&argc, &argv);
+        if (strcmp(arg,"-n") == 0) {
             config.bgfg = 0;
         }
-        else if (strcmp(flag,"-c") == 0) {
+        else if (strcmp(arg,"-c") == 0) {
             if (argc <= 0) {
-                fprintf(stderr, "Error: %s requires a number\n", flag);
-                return 1;
+                return fprintf(stderr, "Error: %s requires a number\n", arg), 1;
             }
             config.num_accents = atoi(args_shift(&argc, &argv));
         }
-        else if (strcmp(flag,"-s") == 0) {
+        else if (strcmp(arg,"-s") == 0) {
             if (argc <= 0) {
-                fprintf(stderr, "Error: %s requires a float percentage\n", flag);
-                return 1;
+                return fprintf(stderr, "Error: %s requires a float percentage\n", arg), 1;
             }
             config.saturation = atof(args_shift(&argc, &argv));
         }
-        else if (strcmp(flag,"-m") == 0) {
+        else if (strcmp(arg,"-m") == 0) {
             if (argc <= 0) {
-                fprintf(stderr, "Error: %s requires either 0 or 1\n", flag);
-                return 1;
+                return fprintf(stderr, "Error: %s requires either 0 or 1\n", arg), 1;
             }
             config.method = atoi(args_shift(&argc, &argv));
             if (config.method > 1 || config.method < 0) {
                 return 1;
             }
         }
-        else if (strcmp(flag,"-f") == 0) {
+        else if (strcmp(arg,"-f") == 0) {
             if (argc <= 0) {
-                fprintf(stderr, "Error: %s requires either 0 or 1\n", flag);
+                fprintf(stderr, "Error: %s requires either 0 or 1\n", arg);
                 return 1;
             }
             config.format = atoi(args_shift(&argc, &argv));
@@ -394,15 +412,39 @@ int main(int argc, char **argv) {
                 return 1;
             }
         }
-        else if (strcmp(flag,"-t") == 0) {
+        else if (strcmp(arg,"-t") == 0) {
             if (argc <= 0) {
-                fprintf(stderr, "Error: %s requires a file\n", flag);
+                fprintf(stderr, "Error: %s requires a file\n", arg);
                 return 1;
             }
             template_file = args_shift(&argc, &argv);
+            config.using_template = strlen(template_file);
         }
         else {
-            const char *img_path = flag;
+            if (input_count < 128) {
+                input_files[input_count++] = arg;
+            } else {
+                fprintf(stderr, "Error: too many inputs, skipping ...");
+            }
+        }
+    }
+    for (int i = 0; i < input_count; i++) {
+        const char *img_path = input_files[i];
+        uint32_t hash = hash_metadata(img_path, config);
+        char cache_path[PATH_MAX];
+        get_cache_path(hash, cache_path, sizeof(cache_path));
+    
+        Color palette[16];
+        Color bg, fg;
+        int cached = 0;
+        FILE *f = fopen(cache_path, "rb");
+        if (f) {
+            fread(&bg, sizeof(Color), 1, f); 
+            fread(&fg, sizeof(Color), 1, f);
+            fread(palette, sizeof(Color), config.num_accents, f);
+            cached = 1;
+        }
+        if (!cached) {
             int w, h, channels;
             uint8_t *pixels = stbi_load(img_path, &w, &h, &channels, 4);
             if (pixels == NULL ) {
@@ -410,65 +452,45 @@ int main(int argc, char **argv) {
                 return 1;
             }
 
-            size_t total_bytes = (size_t)(w * h * channels);
-            uint32_t hash = final_hash(pixels, total_bytes, config);
-
-            char cache_path[PATH_MAX];
-            get_cache_path(hash, cache_path, sizeof(cache_path));
-
-            Color palette[16];
-            Color bg, fg;
-            FILE *f = fopen(cache_path, "rb");
-            if (f) {
-                fread(&bg, sizeof(Color), 1, f); 
-                fread(&fg, sizeof(Color), 1, f);
-                fread(palette, sizeof(Color), config.num_accents, f);
-                fclose(f);
-                stbi_image_free(pixels);
+            if (config.method == 0) {
+                generate_scheme(pixels, w, h, config, palette, &bg, &fg);
             } else {
-                if (config.method == 0) {
-                    generate_scheme(pixels, w, h, config, palette, &bg, &fg);
-                } else {
-                    generate_scheme_kmeans(pixels, w, h, config, palette, &bg, &fg);
-                }
-                FILE *fw = fopen(cache_path, "rb");
+                generate_scheme_kmeans(pixels, w, h, config, palette, &bg, &fg);
+            }
+            FILE *fw = fopen(cache_path, "wb");
+            if (fw) {
+                fwrite(&bg, sizeof(Color), 1, fw);
+                fwrite(&fg, sizeof(Color), 1, fw);
+                fwrite(palette, sizeof(Color), config.num_accents, fw);
+                fclose(fw);
+            }
+            stbi_image_free(pixels);
+        }
+        if (template_file) {
+            FILE *temp_f = fopen(template_file, "r");
+            if (!temp_f) {
+                fprintf(stderr, "Error: could not read template file\n");
+            }
+            char *result = template_processor(temp_f, bg, fg, palette, config);
+            fclose(temp_f);
+            if (result) {
+                fputs(result, stdout);
+                FILE *fw = fopen(cache_path, "wb");
                 if (fw) {
-                    fwrite(&bg, sizeof(Color), 1, fw);
-                    fwrite(&fg, sizeof(Color), 1, fw);
-                    fwrite(palette, sizeof(Color), config.num_accents, fw);
+                    fwrite(result, 1, strlen(result), fw);
                     fclose(fw);
                 }
-                stbi_image_free(pixels);
-            }            
-            
-            if (template_file) {
-                FILE *temp_f = fopen(template_file, "r");
-                if (!temp_f) {
-                    fprintf(stderr, "Error: could not read template file\n");
-                }
-                template_processor(temp_f, bg, fg, palette, config);
-                fclose(temp_f);
-            } else {
-                switch (config.format) {
-                    case 0:
-                        if (config.bgfg) {
-                            printf("rgb(%d, %d, %d)\n", bg.r, bg.g, bg.b);
-                            printf("rgb(%d, %d, %d)\n", fg.r, fg.g, fg.b);
-                        }
-                        for (int i = 0; i < config.num_accents; i++) {
-                            printf("rgb(%d, %d, %d)\n", palette[i].r, palette[i].g, palette[i].b);
-                        }
-                        break;
-                    case 1:
-                        if (config.bgfg) {
-                            printf("#%02X%02X%02X\n", bg.r, bg.g, bg.b);
-                            printf("#%02X%02X%02X\n", fg.r, fg.g, fg.b);
-                        }
-                        for (int i = 0; i < config.num_accents; i++) {
-                            printf("#%02X%02X%02X\n", palette[i].r, palette[i].g, palette[i].b);
-                        }
-                        break;
-                    }
+                free(result);
+            }
+        } else {
+            const char *pstring = (config.format == 1) ? "#%02X%02X%02X\n" : "rgb(%d, %d, %d)\n";
+
+            if (config.bgfg) {
+                printf(pstring, bg.r, bg.g, bg.b);
+                printf(pstring, fg.r, fg.g, fg.b);
+            }
+            for (int i = 0; i < config.num_accents; i++) {
+                printf(pstring, palette[i].r, palette[i].g, palette[i].b);
             }
         }
     }

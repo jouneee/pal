@@ -1,0 +1,13 @@
+[colors]
+
+background=`@background`ff
+text=`@foreground`ff
+prompt=`@foreground`ff
+placeholder=`@color2`ff
+input=`@foreground`ff
+match=`@foreground`ff
+selection=`@color4`ff
+selection-text=`@background`ff
+selection-match=`@color3`ff
+counter=`@color5`ff
+border=`@foreground`ff

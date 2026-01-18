@@ -1,13 +1,13 @@
 layout {
     focus-ring {
         inactive-color "`@background`"
-        active-color "`@color4`"
+        active-color "`@color2`"
     }
 }
 
 recent-windows {
     highlight {
-        active-color "`@color4`"
-        urgent-color "`@color1`"
+        active-color "`@color2`"
+        urgent-color "`@color0`"
     }
 }
