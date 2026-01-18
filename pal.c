@@ -4,12 +4,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <limits.h>
+#include <errno.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
 #define MAX_PROVIDED_IMAGES 128
+#define MAX_TEMPLATES 128
 #define MAX_PLACEHOLDER_LEN 32
 #define SAMPLE_COUNT 1024
 #define PALETTE_COUNT 16
@@ -36,6 +39,7 @@ typedef enum {
 
 typedef struct {
     int bgfg;
+    int silent;
     int using_template;
     float saturation;
     Method method;
@@ -326,24 +330,6 @@ uint32_t hash_metadata(const char *filename, Config config)
     return h;
 }
 
-void get_cache_path(uint32_t hash, char *output, size_t size) 
-{
-    const char *cache_path = getenv("XDG_CACHE_HOME");
-    char dir_path[PATH_MAX];
-
-    if (cache_path) {
-        snprintf(dir_path, sizeof(dir_path), "%s/pal", cache_path);
-    } else {
-        const char *home_path = getenv("HOME");
-        if (home_path == NULL) {
-            fprintf(stderr, "Error: no home env var found");
-        }
-        snprintf(dir_path, sizeof(dir_path), "%s/.cache/pal", home_path);
-    }
-    mkdir(dir_path, 0755);
-    snprintf(output, size, "%s/%08X", dir_path, hash);
-}
-
 char *args_shift(int *argc, char ***argv) {
     assert(*argc > 0);
     char *result = **argv;
@@ -352,11 +338,49 @@ char *args_shift(int *argc, char ***argv) {
     return result;
 }
 
+void directory_helper(const char *home) {
+    if (!home) fprintf(stderr, "HOME env not set\n"), 1;
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/.cache/pal", home);
+    mkdir(path, 0755);
+
+    snprintf(path, sizeof(path), "%s/.cache/pal/other", home);
+    mkdir(path, 0755);
+}
+
+void get_templates_path(const char *home, char *out, size_t size) {
+    snprintf(out, size, "%s/.config/pal/", home);
+}
+
+void get_templates(char* templ_dir, char (*out)[MAX_TEMPLATES], int *count) {
+    DIR *d = opendir(templ_dir);
+    if (!d) {
+        *count = 0; 
+        return;
+    } 
+    struct dirent *e;
+    *count = 0;
+    while ((e = readdir(d)) && *count < MAX_PROVIDED_IMAGES) {
+        if (e->d_type != DT_REG) continue;
+        strncpy(out[*count], e->d_name, 255);
+        out[*count][255] = '\0';
+        (*count)++;
+    }
+    closedir(d);
+}
+
+void get_palettes_cache_path(uint32_t hash, const char *home, char *out, size_t size) {
+    snprintf(out, size, "%s/.cache/pal/other/%08X", home, hash);
+}
+
+void get_templates_cache_path(const char *home, const char *templ, char *out, size_t size) {
+    snprintf(out, size, "%s/.cache/pal/%s", home, templ);
+}
+
 int main(int argc, char **argv) {
     const char *program = args_shift(&argc, &argv);
-    const char *template_file = NULL;
     Config config = {   .bgfg = 1,
-                        .using_template = 0,
+                        .silent = 0,
                         .saturation = 1.0, 
                         .method = KMEANS, 
                         .format = HEX };
@@ -368,10 +392,10 @@ int main(int argc, char **argv) {
         printf("Usage: %s [arg1] [arg2] <image1> <image2> ...\n", program);
         printf("\n");
         printf("\t-n \tDont print background and foreground\n");
+        printf("\t-nv\tNo output\n");
         printf("\t-s \tSaturation (float)\n");
         printf("\t-m \tColor picking method (0 - Area Average, 1 - K-Means)\n");
         printf("\t-f \tOutput format (0 - rgb, 1 - hex)\n");
-        printf("\t-t \tTemplate to output\n");
         return 1;
     }
 
@@ -380,11 +404,14 @@ int main(int argc, char **argv) {
         if (strcmp(arg,"-n") == 0) {
             config.bgfg = 0;
         }
-        else if (strcmp(arg,"-s") == 0) {
+        else if (strcmp(arg, "-nv") == 0) {
+            config.silent = 1;
+        }
+        else if (strcmp(arg, "-s") == 0) {
             if (argc <= 0) return fprintf(stderr, "Error: %s requires a float percentage\n", arg), 1;
 
             config.saturation = atof(args_shift(&argc, &argv));
-            if (config.method > 1 || config.method < 0) return 1;
+            if (config.saturation > 5.0 || config.saturation < 0.0) return 1;
         }
         else if (strcmp(arg,"-m") == 0) {
             if (argc <= 0) return fprintf(stderr, "Error: %s requires either 0 or 1\n", arg), 1;
@@ -398,14 +425,6 @@ int main(int argc, char **argv) {
             config.format = atoi(args_shift(&argc, &argv));
             if (config.format > 1 || config.format < 0) return 1;
         }
-        else if (strcmp(arg,"-t") == 0) {
-            if (argc <= 0) {
-                fprintf(stderr, "Error: %s requires a file\n", arg);
-                return 1;
-            }
-            template_file = args_shift(&argc, &argv);
-            config.using_template = strlen(template_file) + fnv32_hash((unsigned char *)template_file, strlen(template_file));
-        }
         else {
             if (input_count < MAX_PROVIDED_IMAGES) {
                 input_files[input_count++] = arg;
@@ -414,28 +433,28 @@ int main(int argc, char **argv) {
             }
         }
     }
+
+    const char *home = getenv("HOME");
+    if (!home) fprintf(stderr, "HOME not set\n"), 1;
+    directory_helper(home);
+
+    char template_dir[PATH_MAX]; // ~/.config/pal/
+    get_templates_path(home, template_dir, sizeof(template_dir));
+
+    char template_files[MAX_PROVIDED_IMAGES][MAX_TEMPLATES];
+    int template_count = 0;
+    get_templates(template_dir, template_files, &template_count);
+
     for (int i = 0; i < input_count; i++) {
         const char *img_path = input_files[i];
         uint32_t hash = hash_metadata(img_path, config);
-        char cache_path[PATH_MAX];
-        get_cache_path(hash, cache_path, sizeof(cache_path));
-        char template_cache_path[PATH_MAX];
-        get_cache_path(hash, template_cache_path, sizeof(template_cache_path));
+        char palettes_cache_path[PATH_MAX]; // ~/.cache/other/pal/
+        get_palettes_cache_path(hash, home, palettes_cache_path, sizeof(palettes_cache_path));
 
-        if (template_file) {
-            FILE *ft = fopen(template_cache_path, "r");
-            if (ft) {
-                char buffer[4096];
-                while (fgets(buffer, sizeof(buffer), ft)) fputs(buffer, stdout);
-                fclose(ft);
-                continue;
-            }
-        }
-    
         Color palette[16];
         Color bg, fg;
         int cached_palette = 0;
-        FILE *f = fopen(cache_path, "r");
+        FILE *f = fopen(palettes_cache_path, "r");
         if (f) {
             fread(&bg,     sizeof(Color), 1, f); 
             fread(&fg,     sizeof(Color), 1, f);
@@ -455,7 +474,7 @@ int main(int argc, char **argv) {
             } else {
                 generate_scheme_kmeans(pixels, w, h, config, palette, &bg, &fg);
             }
-            FILE *fw = fopen(cache_path, "w");
+            FILE *fw = fopen(palettes_cache_path, "w");
             if (fw) {
                 fwrite(&bg, sizeof(Color), 1, fw);
                 fwrite(&fg, sizeof(Color), 1, fw);
@@ -464,27 +483,29 @@ int main(int argc, char **argv) {
             }
             stbi_image_free(pixels);
         }
-        if (template_file) {
-            FILE *temp_f = fopen(template_file, "r");
-            if (temp_f) {
-                char *result = template_processor(temp_f, bg, fg, palette, config);
-                fclose(temp_f);
-                if (result) {
-                    fputs(result, stdout);
-                    FILE *fw = fopen(template_cache_path, "wb");
-                    if (fw) {
-                        fputs(result, fw);
-                        fclose(fw);
-                    }
-                    free(result);
-                }
-            } else {
-                fprintf(stderr, "Error: could not read template file\n");
-                return 1;
+        for (int t = 0; t < template_count; t++) {
+            char src[PATH_MAX];
+            snprintf(src, sizeof(src), "%s/%s", template_dir, template_files[t]);
+            
+            FILE *templ = fopen(src, "r");
+            if (!templ) continue;
+            
+            char *result = template_processor(templ, bg, fg, palette, config);
+            fclose(templ);
+            if (!result) continue;
+            
+            char out[PATH_MAX];
+            get_templates_cache_path(home, template_files[t], out, sizeof(out)); // ~/.cache/pal/
+            
+            FILE *output = fopen(out, "w");
+            if (output) {
+                fputs(result, output);
+                fclose(output);
             }
-        } else {
+            free(result);
+        }
+        if (!config.silent) {
             const char *pstring = (config.format == 1) ? "#%02X%02X%02X\n" : "rgb(%d, %d, %d)\n";
-
             if (config.bgfg) {
                 printf(pstring, bg.r, bg.g, bg.b);
                 printf(pstring, fg.r, fg.g, fg.b);
