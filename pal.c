@@ -433,18 +433,30 @@ int main(int argc, char **argv) {
         uint32_t hash = hash_metadata(img_path, config);
         char cache_path[PATH_MAX];
         get_cache_path(hash, cache_path, sizeof(cache_path));
+        char template_cache_path[PATH_MAX];
+        get_cache_path(hash, template_cache_path, sizeof(template_cache_path));
+
+        if (template_file) {
+            FILE *ft = fopen(template_cache_path, "r");
+            if (ft) {
+                char buffer[4096];
+                while (fgets(buffer, sizeof(buffer), ft)) fputs(buffer, stdout);
+                fclose(ft);
+                continue;
+            }
+        }
     
         Color palette[16];
         Color bg, fg;
-        int cached = 0;
+        int cached_palette = 0;
         FILE *f = fopen(cache_path, "rb");
         if (f) {
             fread(&bg, sizeof(Color), 1, f); 
             fread(&fg, sizeof(Color), 1, f);
             fread(palette, sizeof(Color), config.num_accents, f);
-            cached = 1;
+            cached_palette = 1;
         }
-        if (!cached) {
+        if (!cached_palette) {
             int w, h, channels;
             uint8_t *pixels = stbi_load(img_path, &w, &h, &channels, 4);
             if (pixels == NULL ) {
@@ -475,9 +487,9 @@ int main(int argc, char **argv) {
             fclose(temp_f);
             if (result) {
                 fputs(result, stdout);
-                FILE *fw = fopen(cache_path, "wb");
+                FILE *fw = fopen(template_cache_path, "wb");
                 if (fw) {
-                    fwrite(result, 1, strlen(result), fw);
+                    fputs(result, fw);
                     fclose(fw);
                 }
                 free(result);
