@@ -480,19 +480,21 @@ int main(int argc, char **argv) {
         }
         if (template_file) {
             FILE *temp_f = fopen(template_file, "r");
-            if (!temp_f) {
-                fprintf(stderr, "Error: could not read template file\n");
-            }
-            char *result = template_processor(temp_f, bg, fg, palette, config);
-            fclose(temp_f);
-            if (result) {
-                fputs(result, stdout);
-                FILE *fw = fopen(template_cache_path, "wb");
-                if (fw) {
-                    fputs(result, fw);
-                    fclose(fw);
+            if (temp_f) {
+                char *result = template_processor(temp_f, bg, fg, palette, config);
+                fclose(temp_f);
+                if (result) {
+                    fputs(result, stdout);
+                    FILE *fw = fopen(template_cache_path, "wb");
+                    if (fw) {
+                        fputs(result, fw);
+                        fclose(fw);
+                    }
+                    free(result);
                 }
-                free(result);
+            } else {
+                fprintf(stderr, "Error: could not read template file\n");
+                return 1;
             }
         } else {
             const char *pstring = (config.format == 1) ? "#%02X%02X%02X\n" : "rgb(%d, %d, %d)\n";
