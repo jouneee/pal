@@ -11,6 +11,8 @@ Template variables must be wrapped in `` and start with @. Allowed variables are
 - @foreground 
 - @color0 ... @colorN.
 
-Templates are taken from ~/.config/pal generated schemes are output to ~/.cache/pal  
+Templates are taken from ~/.config/pal
+
+Generated schemes are output to ~/.cache/pal  
 
 A few template examples are provided in repo examples folder.
