@@ -9,7 +9,7 @@ Requires [stb_image.h](https://github.com/nothings/stb) to compile.
 Template variables must be wrapped in `` and start with @. Allowed variables are: 
 - @background 
 - @foreground 
-- @color0 ... @colorN.
+- @color0 ... @color16
 
 Templates are taken from ~/.config/pal
 
